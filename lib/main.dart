@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:video_player/video_player.dart';
 import 'widgets/camera_feed.dart';
 import 'widgets/camera_overlay.dart';
 import 'widgets/control_dock.dart';
@@ -59,6 +60,26 @@ class _PhotoOverlay {
     this.initialized = false,
   });
 }
+class _VideoOverlay {
+  final String id;
+  final File file;
+  VideoPlayerController controller;
+  Offset position;
+  Size size;
+  bool initialized;
+  bool isPlaying;
+
+  _VideoOverlay({
+    required this.id,
+    required this.file,
+    required this.controller,
+    this.position = Offset.zero,
+    this.size = const Size(180, 240),
+    this.initialized = false,
+    this.isPlaying = false,
+  });
+}
+
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
 
@@ -94,6 +115,10 @@ class _MyHomePageState extends State<MyHomePage> {
   // Photo overlay state (multi-photo support)
   final List<_PhotoOverlay> _photoOverlays = [];
   int _nextPhotoId = 0;
+
+  // Video overlay state
+  final List<_VideoOverlay> _videoOverlays = [];
+  int _nextVideoId = 0;
 
   // Edge light
   bool _isEdgeLightOn = false;
@@ -299,6 +324,16 @@ class _MyHomePageState extends State<MyHomePage> {
         'normW': p.size.width / screenW,
         'normH': p.size.height / screenH,
       }).toList();
+      // Build video list from file paths
+      final List<Map<String, dynamic>> videoList = _videoOverlays.map((v) => {
+        'id': v.id,
+        'path': v.file.path,
+        'normX': v.position.dx / screenW,
+        'normY': v.position.dy / screenH,
+        'normW': v.size.width / screenW,
+        'normH': v.size.height / screenH,
+        'isPlaying': v.isPlaying,
+      }).toList();
       // Release Flutter camera before native recording starts
       await _cameraController?.dispose();
       _cameraController = null;
@@ -316,6 +351,7 @@ class _MyHomePageState extends State<MyHomePage> {
         pipShadowAlpha: _pipShadowAlpha,
         pipZoom: _pipZoom,
         photos: photoList,
+        videos: videoList,
       );
     }
   }
@@ -331,6 +367,14 @@ class _MyHomePageState extends State<MyHomePage> {
       'normW': p.size.width / screenW,
       'normH': p.size.height / screenH,
     }).toList();
+    final videoList = _videoOverlays.map((v) => {
+      'id': v.id,
+      'normX': v.position.dx / screenW,
+      'normY': v.position.dy / screenH,
+      'normW': v.size.width / screenW,
+      'normH': v.size.height / screenH,
+      'isPlaying': v.isPlaying,
+    }).toList();
     _mixer.updatePipConfig(
       pipNormX: _pipPosition.dx / screenW,
       pipNormY: _pipPosition.dy / screenH,
@@ -341,6 +385,7 @@ class _MyHomePageState extends State<MyHomePage> {
       pipZoom: _pipZoom,
       pipEnabled: _isPiPMode,
       photos: photoList,
+      videos: videoList,
     );
   }
 
@@ -376,6 +421,59 @@ class _MyHomePageState extends State<MyHomePage> {
   void _removePhoto(String id) {
     setState(() {
       _photoOverlays.removeWhere((p) => p.id == id);
+    });
+    _syncPipConfig();
+  }
+
+  Future<void> _pickVideo() async {
+    final picker = ImagePicker();
+    final picked = await picker.pickVideo(source: ImageSource.gallery);
+    if (picked != null) {
+      final id = 'video_${_nextVideoId++}';
+      final file = File(picked.path);
+      final controller = VideoPlayerController.file(file);
+      await controller.initialize();
+      setState(() {
+        _videoOverlays.add(_VideoOverlay(
+          id: id,
+          file: file,
+          controller: controller,
+        ));
+      });
+      if (_isRecording) {
+        final screenW = MediaQuery.of(context).size.width;
+        final screenH = MediaQuery.of(context).size.height;
+        await _mixer.addVideo(
+          id: id,
+          path: picked.path,
+          normX: 0,
+          normY: 0,
+          normW: 180 / screenW,
+          normH: 240 / screenH,
+        );
+        _syncPipConfig();
+      }
+    }
+  }
+
+  void _toggleVideoPlayback(String id) {
+    final overlay = _videoOverlays.firstWhere((v) => v.id == id);
+    if (overlay.isPlaying) {
+      overlay.controller.pause();
+    } else {
+      overlay.controller.play();
+    }
+    setState(() {
+      overlay.isPlaying = !overlay.isPlaying;
+    });
+    _syncPipConfig();
+  }
+
+  void _removeVideo(String id) {
+    final overlay = _videoOverlays.firstWhere((v) => v.id == id);
+    overlay.controller.dispose();
+    setState(() {
+      _videoOverlays.removeWhere((v) => v.id == id);
     });
     _syncPipConfig();
   }
@@ -489,6 +587,142 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  // Video overlay (multi-video support)
+  Widget _buildVideoOverlay(double maxW, double maxH) {
+    const minSize = Size(100, 130);
+    return Stack(
+      children: _videoOverlays.map((video) {
+        if (!video.initialized) {
+          video.initialized = true;
+          final baseX = 16.0 + (_videoOverlays.indexOf(video) * 30) % (maxW - video.size.width - 16);
+          final baseY = 380.0 + (_videoOverlays.indexOf(video) * 40) % (maxH - video.size.height - 380);
+          video.position = Offset(baseX, baseY);
+        }
+        final clampedTop = video.position.dy.clamp(0.0, maxH - video.size.height);
+        final clampedLeft = video.position.dx.clamp(0.0, maxW - video.size.width);
+        return Positioned(
+          key: ValueKey(video.id),
+          top: clampedTop,
+          left: clampedLeft,
+          width: video.size.width,
+          height: video.size.height,
+          child: Container(
+            decoration: BoxDecoration(
+              border: Border.all(color: Colors.white.withValues(alpha: 0.5), width: 2),
+              borderRadius: BorderRadius.circular(_pipCornerRadius.clamp(0, 30) + 2),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: _pipShadowAlpha.clamp(0, 255) / 255),
+                  blurRadius: 12,
+                  offset: const Offset(3, 7),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(_pipCornerRadius.clamp(0, 30)),
+              child: Stack(
+                children: [
+                  ClipRect(
+                    child: Transform.scale(
+                      scale: _pipZoom.clamp(1.0, 3.0),
+                      alignment: Alignment.center,
+                      child: VideoPlayer(video.controller),
+                    ),
+                  ),
+                  // Play/pause + drag overlay
+                  Positioned.fill(
+                    child: GestureDetector(
+                      onTapUp: (details) {
+                        final localPos = details.localPosition;
+                        final size = video.size;
+                        // Ignore tap in resize handle area (bottom-right 28x28)
+                        if (localPos.dx >= size.width - 28 && localPos.dy >= size.height - 28) return;
+                        // Ignore tap on close button area (top-right 26x26)
+                        if (localPos.dx >= size.width - 26 && localPos.dy <= 26) return;
+                        _toggleVideoPlayback(video.id);
+                      },
+                      onPanUpdate: (details) {
+                        setState(() {
+                          video.position = Offset(
+                            (clampedLeft + details.delta.dx).clamp(0.0, maxW - video.size.width),
+                            (clampedTop + details.delta.dy).clamp(0.0, maxH - video.size.height),
+                          );
+                        });
+                        _syncPipConfig();
+                      },
+                      child: Container(
+                        color: Colors.transparent,
+                        child: Stack(
+                          children: [
+                            if (!video.isPlaying)
+                              Center(
+                                child: Container(
+                                  width: 40,
+                                  height: 40,
+                                  decoration: BoxDecoration(
+                                    color: Colors.black54,
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
+                                  child: const Icon(Icons.play_arrow, color: Colors.white, size: 28),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  // Close button
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      onTap: () => _removeVideo(video.id),
+                      child: Container(
+                        width: 26,
+                        height: 26,
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(13),
+                        ),
+                        child: const Icon(Icons.close, size: 16, color: Colors.white),
+                      ),
+                    ),
+                  ),
+                  // Resize handle
+                  Positioned(
+                    right: 0,
+                    bottom: 0,
+                    width: 28,
+                    height: 28,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onPanUpdate: (details) {
+                        setState(() {
+                          video.size = Size(
+                            (video.size.width + details.delta.dx).clamp(minSize.width, maxW - clampedLeft),
+                            (video.size.height + details.delta.dy).clamp(minSize.height, maxH - clampedTop),
+                          );
+                        });
+                        _syncPipConfig();
+                      },
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.5),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: const Icon(Icons.drag_indicator, size: 18, color: Colors.white),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      }).toList(),
+    );
+  }
+
   @override
   void dispose() {
     _cameraController?.dispose();
@@ -496,6 +730,9 @@ class _MyHomePageState extends State<MyHomePage> {
     _recSub?.cancel();
     _mixer.dispose();
     _notifications.cancelAll();
+    for (final v in _videoOverlays) {
+      v.controller.dispose();
+    }
     super.dispose();
   }
 
@@ -533,6 +770,7 @@ class _MyHomePageState extends State<MyHomePage> {
             tooltip: 'New content',
             onSelected: (value) {
               if (value == 'photo') _pickPhoto();
+              if (value == 'video') _pickVideo();
             },
             itemBuilder: (context) => [
               PopupMenuItem(value: 'photo', child: Row(children: [const Icon(Icons.photo_camera_outlined, size: 20), const SizedBox(width: 12), const Text('Photo')])),
@@ -633,6 +871,9 @@ class _MyHomePageState extends State<MyHomePage> {
 
           // Photo overlay (multi-photo)
           if (_photoOverlays.isNotEmpty) _buildPhotoOverlay(maxW, maxH),
+
+          // Video overlay (multi-video)
+          if (_videoOverlays.isNotEmpty) _buildVideoOverlay(maxW, maxH),
 
           // Recording indicator overlay
           if (_isRecording)

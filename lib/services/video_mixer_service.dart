@@ -47,6 +47,7 @@ class VideoMixerService {
     int pipShadowAlpha = 70,
     double pipZoom = 1.0,
     List<Map<String, dynamic>>? photos,
+    List<Map<String, dynamic>>? videos,
   }) async {
     if (_state == RecordingState.recording) return;
     _state = RecordingState.starting;
@@ -69,6 +70,9 @@ class VideoMixerService {
       };
       if (photos != null && photos.isNotEmpty) {
         args['photos'] = photos;
+      }
+      if (videos != null && videos.isNotEmpty) {
+        args['videos'] = videos;
       }
       final result = await _methodChannel.invokeMethod<Map>('startRecording', args);
       _mainTextureId = result?['textureId'] as int?;
@@ -123,6 +127,26 @@ class VideoMixerService {
     } catch (_) {}
   }
 
+  Future<void> addVideo({
+    required String id,
+    required String path,
+    required double normX,
+    required double normY,
+    required double normW,
+    required double normH,
+  }) async {
+    try {
+      await _methodChannel.invokeMethod('addVideo', {
+        'id': id,
+        'path': path,
+        'normX': normX,
+        'normY': normY,
+        'normW': normW,
+        'normH': normH,
+      });
+    } catch (_) {}
+  }
+
   Future<void> updatePipZoom(double zoom) async {
     try {
       await _methodChannel.invokeMethod('updatePipZoom', {'zoom': zoom});
@@ -139,6 +163,7 @@ class VideoMixerService {
     required double pipZoom,
     required bool pipEnabled,
     List<Map<String, dynamic>>? photos,
+    List<Map<String, dynamic>>? videos,
   }) async {
     try {
       final args = <String, dynamic>{
@@ -153,6 +178,9 @@ class VideoMixerService {
       };
       if (photos != null && photos.isNotEmpty) {
         args['photos'] = photos;
+      }
+      if (videos != null && videos.isNotEmpty) {
+        args['videos'] = videos;
       }
       await _methodChannel.invokeMethod('updatePipConfig', args);
     } catch (_) {}

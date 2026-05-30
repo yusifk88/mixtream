@@ -54,6 +54,20 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
     }
     private var photoOverlays: [PhotoOverlay] = []
 
+    // Video overlay config (multi-video)
+    private struct VideoOverlay {
+        let id: String
+        let url: URL
+        let reader: AVAssetReader
+        let output: AVAssetReaderTrackOutput
+        var normX: CGFloat
+        var normY: CGFloat
+        var normW: CGFloat
+        var normH: CGFloat
+        var currentImage: CGImage?
+    }
+    private var videoOverlays: [VideoOverlay] = []
+
     // Reusable output buffer (720x1280 BGRA)
     private var outputBuffer: CVPixelBuffer?
 
@@ -98,6 +112,21 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
                 print("Mixer: addPhoto \(id) (\(self.photoOverlays.count) total)")
             }
             result(true)
+        case "addVideo":
+            if let args = call.arguments as? [String: Any],
+               let id = args["id"] as? String,
+               let path = args["path"] as? String {
+                let normX = CGFloat(args["normX"] as? Double ?? 0.0)
+                let normY = CGFloat(args["normY"] as? Double ?? 0.0)
+                let normW = CGFloat(args["normW"] as? Double ?? 0.0)
+                let normH = CGFloat(args["normH"] as? Double ?? 0.0)
+                let url = URL(fileURLWithPath: path)
+                if let overlay = createVideoOverlay(id: id, url: url, normX: normX, normY: normY, normW: normW, normH: normH) {
+                    self.videoOverlays.append(overlay)
+                    print("Mixer: addVideo \(id) (\(self.videoOverlays.count) total)")
+                }
+            }
+            result(true)
         case "updatePipZoom":
             if let zoom = call.arguments as? [String: Any], let z = zoom["zoom"] as? Double {
                 pipZoom = max(1.0, CGFloat(z))
@@ -132,9 +161,93 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
                     self.photoOverlays = newOverlays
                     print("Mixer: updatePipConfig \(self.photoOverlays.count) photos (images reused)")
                 }
+                // Multi-video: update positions by ID, reuse readers
+                if let videosArg = args["videos"] as? [[String: Any]] {
+                    var newOverlays: [VideoOverlay] = []
+                    let oldById = Dictionary(uniqueKeysWithValues: self.videoOverlays.map { ($0.id, $0) })
+                    for v in videosArg {
+                        let id = v["id"] as? String ?? ""
+                        if let existing = oldById[id] {
+                            newOverlays.append(VideoOverlay(
+                                id: id, url: existing.url,
+                                reader: existing.reader, output: existing.output,
+                                normX: CGFloat(v["normX"] as? Double ?? 0.0),
+                                normY: CGFloat(v["normY"] as? Double ?? 0.0),
+                                normW: CGFloat(v["normW"] as? Double ?? 0.0),
+                                normH: CGFloat(v["normH"] as? Double ?? 0.0),
+                                currentImage: existing.currentImage
+                            ))
+                        }
+                    }
+                    // Close readers for removed overlays
+                    let newIds = Set(newOverlays.map { $0.id })
+                    for old in self.videoOverlays {
+                        if !newIds.contains(old.id) {
+                            old.reader.cancelReading()
+                        }
+                    }
+                    self.videoOverlays = newOverlays
+                    print("Mixer: updatePipConfig \(self.videoOverlays.count) videos (readers reused)")
+                }
             }
             result(true)
         default: result(FlutterMethodNotImplemented)
+        }
+    }
+
+    private func createVideoOverlay(id: String, url: URL, normX: CGFloat, normY: CGFloat, normW: CGFloat, normH: CGFloat) -> VideoOverlay? {
+        let asset = AVAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+        do {
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ])
+            guard reader.canAdd(output) else { return nil }
+            reader.add(output)
+            guard reader.startReading() else { return nil }
+            return VideoOverlay(
+                id: id, url: url,
+                reader: reader, output: output,
+                normX: normX, normY: normY,
+                normW: normW, normH: normH,
+                currentImage: nil
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private func advanceVideoOverlay(_ overlay: inout VideoOverlay) {
+        guard overlay.reader.status == .reading else { return }
+        guard let sampleBuffer = overlay.output.copyNextSampleBuffer() else { return }
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bpr = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let src = CVPixelBufferGetBaseAddress(pixelBuffer)
+        let total = height * bpr
+        var data = Data(count: total)
+        data.withUnsafeMutableBytes { dst in
+            guard let dp = dst.baseAddress else { return }
+            memcpy(dp, src, total)
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+        if let provider = CGDataProvider(data: data as CFData),
+           let cgImage = CGImage(
+               width: width, height: height,
+               bitsPerComponent: 8, bitsPerPixel: 32,
+               bytesPerRow: bpr,
+               space: colorSpace,
+               bitmapInfo: bitmapInfo,
+               decoder: nil,
+               shouldInterpolate: false,
+               intent: .defaultIntent
+           ) {
+            overlay.currentImage = cgImage
         }
     }
 
@@ -164,6 +277,22 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
                     normW: CGFloat(p["normW"] as? Double ?? 0.0),
                     normH: CGFloat(p["normH"] as? Double ?? 0.0)
                 ))
+            }
+        }
+
+        // Video overlays (multi-video)
+        self.videoOverlays.removeAll()
+        if let videosArg = args["videos"] as? [[String: Any]] {
+            for v in videosArg {
+                guard let id = v["id"] as? String,
+                      let path = v["path"] as? String else { continue }
+                let normX = CGFloat(v["normX"] as? Double ?? 0.0)
+                let normY = CGFloat(v["normY"] as? Double ?? 0.0)
+                let normW = CGFloat(v["normW"] as? Double ?? 0.0)
+                let normH = CGFloat(v["normH"] as? Double ?? 0.0)
+                if let overlay = createVideoOverlay(id: id, url: URL(fileURLWithPath: path), normX: normX, normY: normY, normW: normW, normH: normH) {
+                    self.videoOverlays.append(overlay)
+                }
             }
         }
 
@@ -264,7 +393,6 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
         else { pipOutput = output }
 
         if let conn = output.connection(with: .video) {
-            // Only set videoOrientation for PiP camera (main camera rotation is handled by vImageRotate)
             if label == "pip", conn.isVideoOrientationSupported { conn.videoOrientation = .portrait }
             if label == "pip", conn.isVideoMirroringSupported { conn.isVideoMirrored = true }
             if label == "main", useMainFront, conn.isVideoMirroringSupported { conn.isVideoMirrored = true }
@@ -285,6 +413,10 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
             self.outputBuffer = nil
             self.startTime = nil
             self.photoOverlays.removeAll()
+            for var vo in self.videoOverlays {
+                vo.reader.cancelReading()
+            }
+            self.videoOverlays.removeAll()
 
             self.videoInput?.markAsFinished()
             guard let aw = self.assetWriter, let url = self.outputURL else {
@@ -299,11 +431,9 @@ class VideoMixerPlugin: NSObject, FlutterPlugin {
                 self.pixelBufferAdaptor = nil
 
                 let path = url.path
-                // Save to Photos in the background
                 PHPhotoLibrary.shared().performChanges({
                     PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
                 }, completionHandler: { success, _ in
-                    // Return file path regardless of Photo Library save result
                     DispatchQueue.main.async { result(path) }
                 })
             }
@@ -422,7 +552,27 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         }
 
-        // Write composited frame (main + PiP + photo) to asset writer
+        // Advance and overlay video overlays (multi-video)
+        for i in 0..<videoOverlays.count {
+            var vo = videoOverlays[i]
+            advanceVideoOverlay(&vo)
+            videoOverlays[i] = vo
+            if let img = vo.currentImage {
+                let vW = Int(vo.normW * CGFloat(outW))
+                let vH = Int(vo.normH * CGFloat(outH))
+                let vX = Int(vo.normX * CGFloat(outW))
+                let vY = Int(vo.normY * CGFloat(outH))
+                let cx = max(0, min(vX, outW - vW))
+                let cy = max(0, min(vY, outH - vH))
+                let cw = min(vW, outW - cx)
+                let ch = min(vH, outH - cy)
+                if cw > 0 && ch > 0 {
+                    overlayPhoto(img, onto: out, atX: cx, atY: cy, targetW: cw, targetH: ch)
+                }
+            }
+        }
+
+        // Write composited frame (main + PiP + photo + video) to asset writer
         let adjustedPts = CMTimeSubtract(pts, start)
         adaptor.append(out, withPresentationTime: adjustedPts)
     }
@@ -513,7 +663,7 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         CVPixelBufferUnlockBaseAddress(out, .readOnly)
     }
 
-    /// Overlay photo onto composited output (BoxFit.cover + rounded rect + shadow + zoom)
+    /// Overlay photo/video frame onto composited output (BoxFit.cover + rounded rect + shadow + zoom)
     private func overlayPhoto(_ image: CGImage, onto out: CVPixelBuffer,
                               atX: Int, atY: Int, targetW: Int, targetH: Int) {
         let imgW = image.width
@@ -524,7 +674,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         let sl = (imgW - sw) / 2
         let st = (imgH - sh) / 2
 
-        // Crop to cover rect
         guard let cropped = image.cropping(to: CGRect(x: sl, y: st, width: sw, height: sh)) else { return }
 
         let cr = min(max(pipCornerRadius, 0), 30)
@@ -532,7 +681,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         let zm = max(pipZoom, 1.0)
         let colorSpace = cropped.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
 
-        // Create rendering context for photo at target size
         let ctx = CGContext(data: nil, width: targetW, height: targetH,
                             bitsPerComponent: 8, bytesPerRow: targetW * 4,
                             space: colorSpace,
@@ -543,7 +691,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
         let photoRect = CGRect(x: 0, y: 0, width: targetW, height: targetH)
         let clipPath = UIBezierPath(roundedRect: photoRect, cornerRadius: cr).cgPath
 
-        // Draw shadow (rounded rect fill at offset with shadow color)
         if sa > 0 {
             cgCtx.saveGState()
             cgCtx.setShadow(offset: CGSize(width: pipShadowDx, height: pipShadowDy),
@@ -553,7 +700,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
             cgCtx.setFillColor(UIColor.black.cgColor)
             cgCtx.fillPath()
             cgCtx.restoreGState()
-            // Clear the filled area, leaving only the shadow
             cgCtx.saveGState()
             cgCtx.addPath(clipPath)
             cgCtx.setBlendMode(.clear)
@@ -561,7 +707,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
             cgCtx.restoreGState()
         }
 
-        // Draw image with rounded rect clip and optional zoom
         cgCtx.saveGState()
         cgCtx.addPath(clipPath)
         cgCtx.clip()
@@ -580,7 +725,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         guard let renderedData = cgCtx.data else { return }
 
-        // Alpha blend onto output
         CVPixelBufferLockBaseAddress(out, .readOnly)
         let outAddr = CVPixelBufferGetBaseAddress(out)!
         let outRow = CVPixelBufferGetBytesPerRow(out)
@@ -629,7 +773,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
                                        rowBytes: srcRow)
             let scaleErr = vImageScale_ARGB8888(&srcImg, &dstImg, nil, vImage_Flags(kvImageNoFlags))
             if scaleErr != kvImageNoError {
-                // Fallback: nearest-neighbor downscale
                 for py in 0..<previewH {
                     for px in 0..<previewW {
                         let sx = (px * outW) / previewW
@@ -643,7 +786,6 @@ extension VideoMixerPlugin: AVCaptureVideoDataOutputSampleBufferDelegate {
                     }
                 }
             } else {
-                // Swap R and B (BGRA → RGBA)
                 let d = dst.bindMemory(to: UInt8.self)
                 for i in 0..<(total / 4) {
                     let base = i * 4

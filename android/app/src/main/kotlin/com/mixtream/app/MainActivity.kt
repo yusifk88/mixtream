@@ -15,6 +15,7 @@ import android.graphics.Color
 import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.Shader
 import android.graphics.SurfaceTexture
@@ -29,6 +30,8 @@ import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaExtractor
 import android.media.MediaMuxer
 import android.media.MediaRecorder
 import android.os.Build
@@ -141,6 +144,11 @@ class MainActivity : FlutterActivity() {
     private var compositeBitmap: Bitmap? = null
     private var pipBitmap: Bitmap? = null
     private var pipShadowPaint: Paint? = null
+    private val srcRect = Rect()
+    private val dstRect = Rect()
+    private val pipSrcRect = Rect()
+    private val pipDstRect = Rect()
+    private val roundRectPath = Path()
     private var reuseMainRgba: ByteArray? = null
     private var previewFrameCount = 0
 
@@ -148,6 +156,15 @@ class MainActivity : FlutterActivity() {
     private var lastPipRgba: ByteArray? = null
     private var lastPipW = 0
     private var lastPipH = 0
+
+    // Last known main frame — reused when compositing at fixed rate outpaces camera
+    private var lastMainRgba: ByteArray? = null
+
+    @Volatile
+    private var isFirstFrame = true
+    private var mainCameraRotation = 0
+    private var pipCameraRotation = 0
+    private var recordingStartRealtimeNs = 0L
 
     // PiP config
     private var pipNormX = 0.82
@@ -160,8 +177,6 @@ class MainActivity : FlutterActivity() {
     private var pipCornerRadius = 14f
     private var pipShadowAlpha = 70
     private var pipZoom = 1.0f
-    private var mainCameraRotation = 0
-    private var pipCameraRotation = 0
 
     // Photo overlay config (multi-photo)
     private data class PhotoOverlay(
@@ -173,6 +188,20 @@ class MainActivity : FlutterActivity() {
         var normH: Double
     )
     private val photoOverlays = mutableListOf<PhotoOverlay>()
+
+    // Video overlay config (multi-video)
+    private data class VideoOverlay(
+        val id: String = "",
+        val path: String,
+        var bitmap: Bitmap?,
+        var normX: Double,
+        var normY: Double,
+        var normW: Double,
+        var normH: Double,
+        var isPlaying: Boolean = false
+    )
+    private val videoOverlays = mutableListOf<VideoOverlay>()
+    private val videoDecoders = mutableMapOf<String, VideoFrameDecoder>()
 
     private fun decodeBitmapSafe(data: ByteArray): Bitmap? {
         return try {
@@ -192,11 +221,13 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private val OUT_W = 720
-    private val OUT_H = 1280
+    private val OUT_W = 480
+    private val OUT_H = 854
     private val PREVIEW_W = 320
     private val PREVIEW_H = 480
-    private val BITRATE = 8_000_000
+    private val OUT_FRAME_RATE = 60
+    private val ONE_FRAME_NS = (1_000_000_000L / OUT_FRAME_RATE)
+    private val BITRATE = 5_000_000
 
     // Preview texture surface size (half of output)
     private val PREVIEW_TEX_W = 360
@@ -258,6 +289,22 @@ class MainActivity : FlutterActivity() {
                         }
                         result.success(true)
                     }
+                    "addVideo" -> {
+                        val id = call.argument<String>("id") ?: ""
+                        val path = call.argument<String>("path") ?: ""
+                        val normX = call.argument<Double>("normX") ?: 0.0
+                        val normY = call.argument<Double>("normY") ?: 0.0
+                        val normW = call.argument<Double>("normW") ?: 0.0
+                        val normH = call.argument<Double>("normH") ?: 0.0
+                        val ov = VideoOverlay(
+                            id = id, path = path, bitmap = null,
+                            normX = normX, normY = normY,
+                            normW = normW, normH = normH
+                        )
+                        videoOverlays.add(ov)
+                        Log.d("Mixer", "addVideo: $id (${videoOverlays.size} total)")
+                        result.success(true)
+                    }
                     "updatePipZoom" -> {
                         val zoom = (call.argument<Double>("zoom") ?: 1.0).toFloat()
                         pipZoom = zoom.coerceAtLeast(1f)
@@ -301,6 +348,35 @@ class MainActivity : FlutterActivity() {
                             photoOverlays.clear()
                             photoOverlays.addAll(newOverlays)
                             Log.d("Mixer", "updatePipConfig: ${photoOverlays.size} photos (bitmaps reused)")
+                        }
+                        // Multi-video: update positions by ID, reuse bitmaps
+                        val rawVideos = call.argument<List<*>>("videos")
+                        if (rawVideos != null) {
+                            val newOverlays = mutableListOf<VideoOverlay>()
+                            val oldById = videoOverlays.associateBy { it.id }
+                            for (item in rawVideos) {
+                                @Suppress("UNCHECKED_CAST")
+                                val v = item as? Map<String, Any> ?: continue
+                                val id = v["id"] as? String ?: ""
+                                val existing = oldById[id]
+                                if (existing != null) {
+                                    val isPlaying = (v["isPlaying"] as? Boolean) ?: existing.isPlaying
+                                    newOverlays.add(VideoOverlay(
+                                        id = id,
+                                        path = existing.path,
+                                        bitmap = existing.bitmap,
+                                        normX = (v["normX"] as? Double) ?: 0.0,
+                                        normY = (v["normY"] as? Double) ?: 0.0,
+                                        normW = (v["normW"] as? Double) ?: 0.0,
+                                        normH = (v["normH"] as? Double) ?: 0.0,
+                                        isPlaying = isPlaying,
+                                    ))
+                                    videoDecoders[id]?.paused = !isPlaying
+                                }
+                            }
+                            videoOverlays.clear()
+                            videoOverlays.addAll(newOverlays)
+                            Log.d("Mixer", "updatePipConfig: ${videoOverlays.size} videos (bitmaps reused)")
                         }
                         result.success(true)
                     }
@@ -411,6 +487,57 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // Video overlays (multi-video)
+        videoOverlays.clear()
+        val videosArg = args["videos"] as? List<*>
+        if (videosArg != null) {
+            for (item in videosArg) {
+                @Suppress("UNCHECKED_CAST")
+                val v = item as? Map<String, Any> ?: continue
+                val id = v["id"] as? String ?: ""
+                val path = v["path"] as? String ?: ""
+                videoOverlays.add(VideoOverlay(
+                    id = id, path = path, bitmap = null,
+                    normX = (v["normX"] as? Double) ?: 0.0,
+                    normY = (v["normY"] as? Double) ?: 0.0,
+                    normW = (v["normW"] as? Double) ?: 0.0,
+                    normH = (v["normH"] as? Double) ?: 0.0,
+                    isPlaying = (v["isPlaying"] as? Boolean) ?: false,
+                ))
+            }
+        }
+
+        // Extract first frame synchronously and start decoders BEFORE recording clock
+        // so they are warmed up and synced to recordingStartRealtimeNs
+        videoDecoders.clear()
+        for (i in videoOverlays.indices) {
+            val vo = videoOverlays[i]
+            try {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(vo.path)
+                val bmp = retriever.getFrameAtTime(0)
+                if (bmp != null) {
+                    val scaled = if (bmp.width > 720 || bmp.height > 720) {
+                        val s = maxOf(bmp.width, 720).toFloat() / 720f
+                        Bitmap.createScaledBitmap(bmp, (bmp.width / s).toInt(), (bmp.height / s).toInt(), true).also { bmp.recycle() }
+                    } else bmp
+                    videoOverlays[i] = vo.copy(bitmap = scaled)
+                }
+                retriever.release()
+            } catch (_: Exception) {}
+            val dec = VideoFrameDecoder(vo.path)
+            dec.start()
+            dec.paused = !vo.isPlaying
+            videoDecoders[vo.id] = dec
+        }
+
+        recordingStartRealtimeNs = System.nanoTime()
+
+        // Tell decoders the recording start time so PTS targets use the recording clock
+        for ((_, dec) in videoDecoders) {
+            dec.startRealtimeNs = recordingStartRealtimeNs
+        }
+
         // Reset muxer state flags for fresh recording
         videoFormatReady = false
         audioFormatReady = false
@@ -460,13 +587,13 @@ class MainActivity : FlutterActivity() {
         setupEncoder(OUT_W, OUT_H)
         startAudioCapture()
 
-        // Open cameras — convert YUV→RGBA in callback and close Image immediately to avoid buffer exhaustion
+        // Open cameras — convert YUV→RGBA in callback and close Image immediately
+        // Cameras only store frames; compositing runs on a fixed 30fps timer (not camera-driven)
         openMixerCamera(mgr, mainId, true, OUT_W, OUT_H) { img ->
             val rgba = YuvConverter.yuvToRgba(img, OUT_W, OUT_H, mainCameraRotation, mirror = useMainFront, reuseOut = reuseMainRgba)
             reuseMainRgba = ByteArray(OUT_W * OUT_H * 4)
             img.close()
             frameLock.withLock { latestMainRgba = rgba }
-            compositeHandler?.post { tryComposite() }
         }
 
         if (pipId != null) {
@@ -482,6 +609,30 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
+
+        // Fixed-rate compositing timer — drives overlay decode rate via latestBitmap
+        compositeHandler?.post(object : Runnable {
+            var lastTick = -1L
+            var lastLogTick = -1L
+            var tickCount = 0
+            override fun run() {
+                if (!isRecording) return
+                val now = System.nanoTime()
+                if (lastTick < 0) { lastTick = now; lastLogTick = now }
+                tryComposite()
+                if (!isRecording) return
+                tickCount++
+                lastTick += ONE_FRAME_NS
+                val nextDelay = maxOf(0L, (lastTick - System.nanoTime()) / 1_000_000)
+                compositeHandler?.postDelayed(this, nextDelay)
+                if (tickCount % (OUT_FRAME_RATE) == 0) {
+                    val elapsed = (System.nanoTime() - lastLogTick) / 1_000_000
+                    val fps = if (elapsed > 0) ((OUT_FRAME_RATE * 1000f) / elapsed) else 0f
+                    Log.d("Mixer", "composite: $tickCount ticks in ${elapsed}ms = ${"%.1f".format(fps)}fps")
+                    lastLogTick = System.nanoTime()
+                }
+            }
+        })
 
         previewFrameCount = 0
         pipPreviewFrameCount = 0
@@ -556,6 +707,10 @@ class MainActivity : FlutterActivity() {
             pipBitmap?.recycle(); pipBitmap = null
             for (po in photoOverlays) { po.bitmap.recycle() }
             photoOverlays.clear()
+            for ((_, dec) in videoDecoders) { dec.stop() }
+            videoDecoders.clear()
+            videoOverlays.clear()
+            recordingStartRealtimeNs = 0L
 
             previewSurface = null
             previewTextureEntry?.release()
@@ -615,8 +770,8 @@ class MainActivity : FlutterActivity() {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_FRAME_RATE, OUT_FRAME_RATE)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
         mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
             configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -963,7 +1118,10 @@ class MainActivity : FlutterActivity() {
                 latestPipRgba = null
             }
         }
-        if (mainRgba == null) return
+        // Reuse last camera frame if no new one (fixed-rate compositing may outpace camera)
+        val frame = mainRgba ?: lastMainRgba
+        if (frame == null) return
+        if (mainRgba != null) lastMainRgba = mainRgba
 
         val pipRgba = newPipRgba ?: lastPipRgba
         val pipTargetW = if (newPipRgba != null) newPipW else lastPipW
@@ -979,7 +1137,7 @@ class MainActivity : FlutterActivity() {
         val bmp = compositeBitmap
         val surface = encoderSurface
         if (bmp != null && surface != null && surface.isValid) {
-            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(mainRgba))
+            bmp.copyPixelsFromBuffer(ByteBuffer.wrap(frame))
             var canvas: Canvas? = null
             try {
                 canvas = surface.lockCanvas(null)
@@ -1001,30 +1159,58 @@ class MainActivity : FlutterActivity() {
                         val l = px.toFloat(); val t = py.toFloat()
                         val r = (px + pipTargetW).toFloat(); val b2 = (py + pipTargetH).toFloat()
                         val r2 = pipCornerRadius.coerceIn(0f, 30f)
-                        val sa = pipShadowAlpha.coerceIn(0, 255)
-                        val zm = pipZoom.coerceAtLeast(1f)
 
                         val sp = pipShadowPaint!!
-                        sp.color = Color.argb(sa, 0, 0, 0)
+                        sp.color = Color.argb(pipShadowAlpha.coerceIn(0, 255), 0, 0, 0)
                         canvas.drawRoundRect(l + PIP_SHADOW_DX, t + PIP_SHADOW_DY,
                             r + PIP_SHADOW_DX, b2 + PIP_SHADOW_DY, r2, r2, sp)
 
-                        android.graphics.Path().apply {
-                            addRoundRect(l, t, r, b2, r2, r2, android.graphics.Path.Direction.CW)
-                            canvas.save(); canvas.clipPath(this)
-                            if (zm > 1.0001f) {
-                                val sw = (pipTargetW / zm).toInt(); val sh = (pipTargetH / zm).toInt()
-                                val sl = pipBmp.width / 2 - sw / 2; val st = pipBmp.height / 2 - sh / 2
-                                canvas.drawBitmap(pipBmp, Rect(sl, st, sl + sw, st + sh),
-                                    Rect(px, py, px + pipTargetW, py + pipTargetH), null)
-                            } else {
-                                canvas.drawBitmap(pipBmp, l, t, null)
-                            }
+                        pipSrcRect.set(0, 0, pipBmp.width, pipBmp.height)
+                        pipDstRect.set(px, py, px + pipTargetW, py + pipTargetH)
+                        canvas.drawBitmap(pipBmp, pipSrcRect, pipDstRect, null)
+                    }
+                }
+                // Video overlays (multi-video) with rounded rect + shadow + zoom
+                for (i in videoOverlays.indices) {
+                    val vo = videoOverlays[i]
+                    val dec = videoDecoders[vo.id]
+                    val pBmp = dec?.latestBitmap ?: vo.bitmap
+                    if (pBmp == null || pBmp.isRecycled) continue
+                    val vpx = (vo.normX * OUT_W).toInt().coerceIn(0, OUT_W)
+                    val vpy = (vo.normY * OUT_H).toInt().coerceIn(0, OUT_H)
+                    val vpw = (vo.normW * OUT_W).toInt().coerceIn(8, OUT_W - vpx)
+                    val vph = (vo.normH * OUT_H).toInt().coerceIn(8, OUT_H - vpy)
+                    if (vpw > 0 && vph > 0) {
+                        val r2 = pipCornerRadius.coerceIn(0f, 30f)
+                        val vpL = vpx.toFloat(); val vpT = vpy.toFloat()
+                        val vpR = (vpx + vpw).toFloat(); val vpB = (vpy + vph).toFloat()
+                        // Shadow
+                        val sp = pipShadowPaint!!
+                        sp.color = Color.argb(pipShadowAlpha.coerceIn(0, 255), 0, 0, 0)
+                        canvas.drawRoundRect(vpL + PIP_SHADOW_DX, vpT + PIP_SHADOW_DY,
+                            vpR + PIP_SHADOW_DX, vpB + PIP_SHADOW_DY, r2, r2, sp)
+                        // Fitted bitmap with rounded corners
+                        val srcW = pBmp.width; val srcH = pBmp.height
+                        val scale = minOf(vpw.toFloat() / srcW, vph.toFloat() / srcH)
+                        val fitW = (srcW * scale).toInt()
+                        val fitH = (srcH * scale).toInt()
+                        val dx = vpx + (vpw - fitW) / 2
+                        val dy = vpy + (vph - fitH) / 2
+                        srcRect.set(0, 0, srcW, srcH)
+                        dstRect.set(dx, dy, dx + fitW, dy + fitH)
+                        if (r2 > 0f) {
+                            roundRectPath.rewind()
+                            roundRectPath.addRoundRect(vpL, vpT, vpR, vpB, r2, r2, Path.Direction.CW)
+                            canvas.save()
+                            canvas.clipPath(roundRectPath)
+                            canvas.drawBitmap(pBmp, srcRect, dstRect, null)
                             canvas.restore()
+                        } else {
+                            canvas.drawBitmap(pBmp, srcRect, dstRect, null)
                         }
                     }
                 }
-                // Photo overlays (multi-photo) with rounded rect + shadow + zoom
+                // Photo overlays (multi-photo)
                 for (po in photoOverlays) {
                     val pBmp = po.bitmap
                     val ppx = (po.normX * OUT_W).toInt().coerceIn(0, OUT_W)
@@ -1032,38 +1218,32 @@ class MainActivity : FlutterActivity() {
                     val ppw = (po.normW * OUT_W).toInt().coerceIn(8, OUT_W - ppx)
                     val pph = (po.normH * OUT_H).toInt().coerceIn(8, OUT_H - ppy)
                     if (ppw > 0 && pph > 0) {
-                        val l = ppx.toFloat(); val t = ppy.toFloat()
-                        val r = (ppx + ppw).toFloat(); val b2 = (ppy + pph).toFloat()
                         val r2 = pipCornerRadius.coerceIn(0f, 30f)
-                        val sa = pipShadowAlpha.coerceIn(0, 255)
-                        val zm = pipZoom.coerceAtLeast(1f)
-
+                        val ppL = ppx.toFloat(); val ppT = ppy.toFloat()
+                        val ppR = (ppx + ppw).toFloat(); val ppB = (ppy + pph).toFloat()
+                        // Shadow
                         val sp = pipShadowPaint!!
-                        sp.color = Color.argb(sa, 0, 0, 0)
-                        canvas.drawRoundRect(l + PIP_SHADOW_DX, t + PIP_SHADOW_DY,
-                            r + PIP_SHADOW_DX, b2 + PIP_SHADOW_DY, r2, r2, sp)
-
-                        android.graphics.Path().apply {
-                            addRoundRect(l, t, r, b2, r2, r2, android.graphics.Path.Direction.CW)
-                            canvas.save(); canvas.clipPath(this)
-                            val srcW = pBmp.width; val srcH = pBmp.height
-                            val scale = maxOf(ppw.toFloat() / srcW, pph.toFloat() / srcH)
-                            val sw = (ppw / scale).toInt().coerceAtMost(srcW)
-                            val sh = (pph / scale).toInt().coerceAtMost(srcH)
-                            val sl = (srcW - sw) / 2; val st = (srcH - sh) / 2
-                            if (zm > 1.0001f) {
-                                val zsw = (sw / zm).toInt().coerceAtMost(sw)
-                                val zsh = (sh / zm).toInt().coerceAtMost(sh)
-                                val zsl = sl + (sw - zsw) / 2; val zst = st + (sh - zsh) / 2
-                                canvas.drawBitmap(pBmp,
-                                    Rect(zsl, zst, zsl + zsw, zst + zsh),
-                                    Rect(ppx, ppy, ppx + ppw, ppy + pph), null)
-                            } else {
-                                canvas.drawBitmap(pBmp,
-                                    Rect(sl, st, sl + sw, st + sh),
-                                    Rect(ppx, ppy, ppx + ppw, ppy + pph), null)
-                            }
+                        sp.color = Color.argb(pipShadowAlpha.coerceIn(0, 255), 0, 0, 0)
+                        canvas.drawRoundRect(ppL + PIP_SHADOW_DX, ppT + PIP_SHADOW_DY,
+                            ppR + PIP_SHADOW_DX, ppB + PIP_SHADOW_DY, r2, r2, sp)
+                        // Fitted bitmap with rounded corners
+                        val srcW = pBmp.width; val srcH = pBmp.height
+                        val scale = minOf(ppw.toFloat() / srcW, pph.toFloat() / srcH)
+                        val fitW = (srcW * scale).toInt()
+                        val fitH = (srcH * scale).toInt()
+                        val dx = ppx + (ppw - fitW) / 2
+                        val dy = ppy + (pph - fitH) / 2
+                        srcRect.set(0, 0, srcW, srcH)
+                        dstRect.set(dx, dy, dx + fitW, dy + fitH)
+                        if (r2 > 0f) {
+                            roundRectPath.rewind()
+                            roundRectPath.addRoundRect(ppL, ppT, ppR, ppB, r2, r2, Path.Direction.CW)
+                            canvas.save()
+                            canvas.clipPath(roundRectPath)
+                            canvas.drawBitmap(pBmp, srcRect, dstRect, null)
                             canvas.restore()
+                        } else {
+                            canvas.drawBitmap(pBmp, srcRect, dstRect, null)
                         }
                     }
                 }
@@ -1150,6 +1330,234 @@ class MainActivity : FlutterActivity() {
             }
         } catch (e: Exception) {
             Log.e("Mixer", "renderToSurface failed", e)
+        }
+    }
+
+    // ══════════════════════════════════════════════
+    // MediaCodec-based sequential video frame decoder
+    // ══════════════════════════════════════════════
+
+    private class VideoFrameDecoder(
+        private val path: String,
+        private val maxDim: Int = 304
+    ) {
+        @Volatile var latestBitmap: Bitmap? = null
+        @Volatile var frameCount = 0
+        private var thread: Thread? = null
+        @Volatile private var running = false
+
+        @Volatile var startRealtimeNs: Long = -1L
+        @Volatile var paused: Boolean = false
+
+        private var reusePixels: IntArray? = null
+
+        fun start() {
+            running = true
+            thread = Thread { decodeLoop() }.also { it.start() }
+        }
+
+        fun stop() {
+            running = false
+            thread?.join(3000)
+            // Bitmaps are created fresh each frame and left for GC
+        }
+
+        private fun preciseSleep(targetNs: Long) {
+            while (running && !paused) {
+                val now = System.nanoTime()
+                if (now >= targetNs) break
+                val remaining = targetNs - now
+                if (remaining > 2_000_000) {
+                    Thread.sleep(remaining / 1_000_000 - 1, 0)
+                }
+            }
+        }
+
+        private fun decodeLoop() {
+            var extractor: MediaExtractor? = null
+            var decoder: MediaCodec? = null
+            try {
+                extractor = MediaExtractor()
+                extractor.setDataSource(path)
+                var trackIndex = -1
+                for (i in 0 until extractor.trackCount) {
+                    val fmt = extractor.getTrackFormat(i)
+                    if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                        trackIndex = i; break
+                    }
+                }
+                if (trackIndex < 0) { Log.w("VFD", "no video track in $path"); return }
+                extractor.selectTrack(trackIndex)
+                val format = extractor.getTrackFormat(trackIndex)
+                val rawW = format.getInteger(MediaFormat.KEY_WIDTH)
+                val rawH = format.getInteger(MediaFormat.KEY_HEIGHT)
+                val rotation = if (format.containsKey("rotation-degrees")) format.getInteger("rotation-degrees") else 0
+                val displayW: Int; val displayH: Int
+                if (rotation == 90 || rotation == 270) {
+                    displayW = rawH; displayH = rawW
+                } else {
+                    displayW = rawW; displayH = rawH
+                }
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: return
+                val s = maxOf(maxOf(displayW, displayH), maxDim).toFloat() / maxDim
+                val outW = (displayW / s).toInt(); val outH = (displayH / s).toInt()
+
+                val bufSize = outW * outH
+                if (reusePixels == null || reusePixels!!.size != bufSize) {
+                    reusePixels = IntArray(bufSize)
+                }
+
+                decoder = MediaCodec.createDecoderByType(mime)
+                decoder.configure(format, null, null, 0)
+                decoder.start()
+
+                val bufferInfo = MediaCodec.BufferInfo()
+                var sawInputEos = false
+                var sawOutputEos = false
+                var firstFramePtsUs = -1L
+                var timeOriginNs = -1L
+                var resumeFromPause = false
+                var logStartTime = -1L
+
+                while (running && !sawOutputEos) {
+                    if (paused) {
+                        resumeFromPause = true
+                        Thread.sleep(10)
+                        continue
+                    }
+                    if (resumeFromPause) {
+                        firstFramePtsUs = -1L
+                        resumeFromPause = false
+                    }
+
+                    // Feed input
+                    if (!sawInputEos) {
+                        val inIdx = decoder.dequeueInputBuffer(1000L)
+                        if (inIdx >= 0) {
+                            val buf = decoder.getInputBuffer(inIdx)!!
+                            val sampleSize = extractor.readSampleData(buf, 0)
+                            if (sampleSize < 0) {
+                                decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                sawInputEos = true
+                            } else {
+                                decoder.queueInputBuffer(inIdx, 0, sampleSize, extractor.sampleTime, 0)
+                                extractor.advance()
+                            }
+                        }
+                    }
+
+                    // Drain output
+                    val outIdx = decoder.dequeueOutputBuffer(bufferInfo, 1000L)
+                    when {
+                        outIdx >= 0 -> {
+                            val eos = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                            if (eos) sawOutputEos = true
+                            if (!eos && bufferInfo.size > 0) {
+                                val img = decoder.getOutputImage(outIdx)
+                                if (img != null) {
+                                    val imgW = img.width; val imgH = img.height
+                                    val decoderAppliedRotation = rotation != 0 && (imgW != rawW || imgH != rawH)
+                                    val effectiveRotation = if (decoderAppliedRotation) 0 else rotation
+                                    val bmp = yuv420ToBitmapReuse(img, outW, outH, reusePixels!!, effectiveRotation, imgW, imgH, null)
+                                    img.close()
+                                    if (bmp != null && !paused) {
+                                        latestBitmap = bmp
+                                        frameCount++
+                                        val decodeTime = System.nanoTime()
+                                        val ptsUs = bufferInfo.presentationTimeUs
+                                        if (firstFramePtsUs < 0) {
+                                            firstFramePtsUs = ptsUs
+                                            while (startRealtimeNs < 0 && running) {
+                                                Thread.sleep(1)
+                                            }
+                                            if (!running) return
+                                            timeOriginNs = maxOf(System.nanoTime(), startRealtimeNs)
+                                            logStartTime = decodeTime
+                                            Log.d("VFD", "first frame: pts=$ptsUs origin=${timeOriginNs / 1_000_000}ms startRealtimeNs=${startRealtimeNs / 1_000_000}ms")
+                                        }
+                                        val elapsedUs = ptsUs - firstFramePtsUs
+                                        val targetNs = timeOriginNs + elapsedUs * 1000L
+                                        val sleepBefore = System.nanoTime()
+                                        val overshoot = sleepBefore - targetNs
+                                        if (frameCount <= 10 || overshoot > 5_000_000) {
+                                            Log.d("VFD", "frame $frameCount: pts=$ptsUs elapsedUs=$elapsedUs targetDeltaMs=${elapsedUs / 1000} nowDeltaMs=${(sleepBefore - timeOriginNs) / 1_000_000} overshootUs=${overshoot / 1000}")
+                                        }
+                                        if (frameCount % 60 == 0) {
+                                            val elapsed = (System.nanoTime() - logStartTime) / 1_000_000
+                                            val fps = if (elapsed > 0) ((frameCount * 1000f) / elapsed) else 0f
+                                            Log.d("VFD", "frame $frameCount: ${elapsed}ms elapsed = ${"%.1f".format(fps)}fps, lastPts=$ptsUs")
+                                        }
+                                        preciseSleep(targetNs)
+                                    }
+                                }
+                            }
+                            decoder.releaseOutputBuffer(outIdx, false)
+                        }
+                        outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                            Thread.sleep(0, 500_000)
+                        }
+                        outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {}
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("VFD", "decode error $path", e)
+            } finally {
+                try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
+                try { extractor?.release() } catch (_: Exception) {}
+            }
+        }
+
+        companion object {
+            private fun yuv420ToBitmapReuse(
+                img: android.media.Image, w: Int, h: Int,
+                pixels: IntArray, rotation: Int, srcW: Int, srcH: Int,
+                target: Bitmap?
+            ): Bitmap? {
+                val planes = img.planes
+                if (planes.size < 3) return null
+
+                // Bulk-read each plane into a byte array to avoid per-pixel JNI overhead
+                val yBuf = planes[0].buffer
+                val uBuf = planes[1].buffer
+                val vBuf = planes[2].buffer
+                val yStride = planes[0].rowStride
+                val uStride = planes[1].rowStride
+                val vStride = planes[2].rowStride
+                val yPs = planes[0].pixelStride
+                val uPs = planes[1].pixelStride
+                val vPs = planes[2].pixelStride
+                val ySize = yBuf.remaining()
+                val uSize = uBuf.remaining()
+                val vSize = vBuf.remaining()
+                val yArr = ByteArray(ySize); yBuf.get(yArr)
+                val uArr = ByteArray(uSize); uBuf.get(uArr)
+                val vArr = ByteArray(vSize); vBuf.get(vArr)
+
+                // Integer YUV→RGB (BT.601, scaled by 256)
+                val Y_SCALE = 298; val V_R = 409; val U_G = 100; val V_G = 208; val U_B = 516; val ROUND = 128
+                for (y in 0 until h) {
+                    val yOff = y * w
+                    for (x in 0 until w) {
+                        val sx: Int; val sy: Int
+                        when (rotation) {
+                            90 -> { sy = (x * srcH) / w; sx = srcW - 1 - (y * srcW) / h }
+                            270 -> { sy = srcH - 1 - (x * srcH) / w; sx = (y * srcW) / h }
+                            180 -> { sx = srcW - 1 - (x * srcW) / w; sy = srcH - 1 - (y * srcH) / h }
+                            else -> { sx = (x * srcW) / w; sy = (y * srcH) / h }
+                        }
+                        val Y = yArr[sy * yStride + sx * yPs].toInt() and 0xFF
+                        val U = uArr[(sy shr 1) * uStride + (sx shr 1) * uPs].toInt() and 0xFF
+                        val V = vArr[(sy shr 1) * vStride + (sx shr 1) * vPs].toInt() and 0xFF
+                        val yv = Y - 16; val uv = U - 128; val vv = V - 128
+                        val r = (yv * Y_SCALE + vv * V_R + ROUND) shr 8
+                        val g = (yv * Y_SCALE - uv * U_G - vv * V_G + ROUND) shr 8
+                        val b = (yv * Y_SCALE + uv * U_B + ROUND) shr 8
+                        pixels[yOff + x] = (0xFF shl 24) or (r.coerceIn(0, 255) shl 16) or (g.coerceIn(0, 255) shl 8) or b.coerceIn(0, 255)
+                    }
+                }
+                target?.recycle()
+                return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+            }
         }
     }
 
@@ -1242,6 +1650,9 @@ class MainActivity : FlutterActivity() {
             pipBitmap?.recycle(); pipBitmap = null
             for (po in photoOverlays) { po.bitmap.recycle() }
             photoOverlays.clear()
+            for ((_, dec) in videoDecoders) { dec.stop() }
+            videoDecoders.clear()
+            videoOverlays.clear()
             previewSurface = null
             previewTextureEntry?.release(); previewTextureEntry = null
             compositeThread?.quitSafely(); compositeThread = null; compositeHandler = null
